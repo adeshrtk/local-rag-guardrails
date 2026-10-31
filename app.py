@@ -1,12 +1,18 @@
 import os
+import json
 import requests
-from langchain_community.document_loaders import DirectoryLoader, TextLoader
+from langchain_community.document_loaders import PyPDFDirectoryLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_ollama import OllamaEmbeddings, ChatOllama
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
+from rich.console import Console
+from rich.panel import Panel
+from rich.json import JSON as RichJSON
+
+console = Console()
 
 # --- CONFIGURATION ---
 DATA_PATH = "data"
@@ -32,99 +38,153 @@ def check_ollama():
         raise SystemExit(f"[ERROR] Ollama health check failed: {e}")
 
     available = {m["name"].split(":")[0] for m in resp.json().get("models", [])}
-    missing = []
-    for model in [OLLAMA_MODEL, EMBEDDING_MODEL]:
-        if model not in available:
-            missing.append(model)
+    missing = [m for m in [OLLAMA_MODEL, EMBEDDING_MODEL] if m not in available]
     if missing:
         for m in missing:
-            print(f"[ERROR] Model '{m}' not found. Run: ollama pull {m}")
+            console.print(f"[red][ERROR] Model '{m}' not found. Run: ollama pull {m}[/red]")
         raise SystemExit("Please pull the missing models and try again.")
 
-    print(f"[OK] Ollama is running. Models available: {', '.join(available)}")
-
+    console.print(f"[green][OK] Ollama running — models: {', '.join(available)}[/green]")
 
 # ==========================================
 # GUARDRAILS MODULE
 # ==========================================
 def input_guardrail(user_query: str) -> bool:
     """Checks user input for malicious patterns or unsafe content."""
-    
     query_lower = user_query.lower()
-    
-    # Simple heuristic checks (extendable with NeMo Guardrails or Llama Guard if preferred)
     forbidden_keywords = ["ignore previous instructions", "system prompt", "hack"]
     for word in forbidden_keywords:
         if word in query_lower:
-            print(f"[Guardrail Warning] Blocked potential injection attempt keyword: '{word}'")
+            console.print(f"[yellow][Guardrail] Blocked keyword: '{word}'[/yellow]")
             return False
-   
     if len(user_query.strip()) < 3:
-        print("[Guardrail Warning] Query too short.")
+        console.print("[yellow][Guardrail] Query too short.[/yellow]")
         return False
-
     return True
 
 def output_guardrail(response_text: str) -> str:
     """Inspects and cleans the generated LLM response."""
     if not response_text or len(response_text.strip()) == 0:
         return "Guardrail Error: The model returned an empty response."
-    
-    # Example guardrail: Ensure no raw system tags leaked out
-    cleaned_response = response_text.replace("<|im_start|>","").replace("<|im_end|>","")
-    return cleaned_response
+    return response_text.replace("<|im_start|>", "").replace("<|im_end|>", "")
 
 # ==========================================
 # RAG PIPELINE SETUP
 # ==========================================
 def initialize_vector_db():
-    """Loads documents, chunks them, and saves to local Chroma vector store."""
+    """Loads PDFs, chunks them, embeds, and saves to local Chroma vector store."""
     os.makedirs(DATA_PATH, exist_ok=True)
 
-    # Only create the sample file if the data folder is empty
-    if not os.listdir(DATA_PATH):
-        with open(os.path.join(DATA_PATH, "rag_sample.txt"), "w") as f:
-            f.write("Ollama allows developers to run large language models locally on their hardware."
-                    "ChromaDB is an open-source vector database for storing and querying embeddings.")
+    pdf_files = [f for f in os.listdir(DATA_PATH) if f.lower().endswith(".pdf")]
+    if not pdf_files:
+        console.print(
+            Panel(
+                "[bold yellow]No PDF files found in the 'data/' folder.\n\n"
+                "Please add one or more PDF files to:[/bold yellow]\n"
+                f"[cyan]{os.path.abspath(DATA_PATH)}[/cyan]",
+                title="[red]Setup Required[/red]",
+                expand=False,
+            )
+        )
+        raise SystemExit("Add PDFs to the data/ folder and run again.")
 
-    print("Loading documents....")
-    loader = DirectoryLoader(DATA_PATH, glob="**/*.txt", loader_cls=TextLoader)
-    docs = loader.load()
+    console.print(f"[bold]Found {len(pdf_files)} PDF(s):[/bold] {', '.join(pdf_files)}")
 
-    print("Splitting documents into chunks...")
-    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-    chunks = splitter.split_documents(docs)
+    with console.status("[bold green]Loading PDF pages...", spinner="dots"):
+        loader = PyPDFDirectoryLoader(DATA_PATH)
+        docs = loader.load()
+    console.print(f"[green]✓[/green] Loaded {len(docs)} pages from {len(pdf_files)} file(s)")
 
-    print("Generating local embeddings and saving to ChromaDB...")
-    embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
-    vector_store = Chroma.from_documents(documents=chunks, embedding=embeddings, persist_directory=DB_PATH)
+    with console.status("[bold green]Splitting into chunks...", spinner="dots"):
+        splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+        chunks = splitter.split_documents(docs)
+    console.print(f"[green]✓[/green] Created {len(chunks)} chunks")
+
+    with console.status("[bold green]Generating embeddings & saving to ChromaDB...", spinner="dots"):
+        embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
+        vector_store = Chroma.from_documents(
+            documents=chunks, embedding=embeddings, persist_directory=DB_PATH
+        )
+    console.print(f"[green]✓[/green] Embeddings saved to ChromaDB")
+
     return vector_store
-        
+
+
 def get_or_create_db():
     embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
     if os.path.exists(DB_PATH) and os.listdir(DB_PATH):
-        return Chroma(persist_directory=DB_PATH, embedding_function=embeddings)
+        with console.status("[bold green]Loading existing ChromaDB index...", spinner="dots"):
+            db = Chroma(persist_directory=DB_PATH, embedding_function=embeddings)
+        console.print("[green]✓[/green] Loaded existing ChromaDB index")
+        return db
     else:
         return initialize_vector_db()
-    
+
+# ==========================================
+# STREAMING QUERY + JSON RESULT
+# ==========================================
+def query_rag(retriever, prompt, llm, user_input: str) -> dict:
+    """Retrieves docs, streams the LLM answer, and returns a structured JSON result."""
+
+    # 1. Retrieve relevant chunks
+    with console.status("[bold green]Retrieving relevant chunks...", spinner="dots"):
+        source_docs = retriever.invoke(user_input)
+
+    # 2. Build context string
+    def format_docs(docs):
+        return "\n\n".join(doc.page_content for doc in docs)
+
+    context = format_docs(source_docs)
+
+    # 3. Stream the answer token-by-token
+    answer_chain = prompt | llm | StrOutputParser()
+    console.print("\n[bold cyan]Answer:[/bold cyan] ", end="")
+    answer_chunks = []
+    for chunk in answer_chain.stream({"context": context, "input": user_input}):
+        print(chunk, end="", flush=True)
+        answer_chunks.append(chunk)
+    print()  # newline after streaming
+
+    raw_answer = "".join(answer_chunks)
+
+    # 4. Apply output guardrail
+    final_answer = output_guardrail(raw_answer)
+
+    # 5. Build deduplicated source metadata
+    seen = set()
+    sources = []
+    for doc in source_docs:
+        meta = doc.metadata
+        file_name = os.path.basename(meta.get("source", "unknown"))
+        page_num = meta.get("page", 0) + 1  # PyPDF is 0-indexed; show 1-indexed
+        key = (file_name, page_num)
+        if key not in seen:
+            seen.add(key)
+            sources.append({
+                "file": file_name,
+                "page": page_num,
+                "excerpt": doc.page_content[:250].strip() + (
+                    "..." if len(doc.page_content) > 250 else ""
+                ),
+            })
+
+    return {"answer": final_answer, "sources": sources}
+
 # ==========================================
 # MAIN EXECUTION
 # ==========================================
 def main():
-    print("---Initializing Local RAG System---")
+    console.rule("[bold blue]Local RAG with Guardrails[/bold blue]")
     check_ollama()
     vector_store = get_or_create_db()
-    retriever = vector_store.as_retriever(search_kwargs={"k": 2})
-    
-    # Initialize Local Ollama LLM
+    retriever = vector_store.as_retriever(search_kwargs={"k": 3})
+
     llm = ChatOllama(model=OLLAMA_MODEL, temperature=0.1)
-    
-    # Prompt template ensuring grounding
+
     system_prompt = (
         "You are an assistant for question-answering tasks. "
-        "Use the following pieces of retrieved context to answer "
-        "the question. If you don't know the answer, say that you "
-        "don't know.\n\n"
+        "Use ONLY the following retrieved context to answer the question. "
+        "If the answer is not in the context, say you don't know.\n\n"
         "{context}"
     )
     prompt = ChatPromptTemplate.from_messages([
@@ -132,38 +192,35 @@ def main():
         ("human", "{input}")
     ])
 
-    def format_docs(docs):
-        return "\n\n".join(doc.page_content for doc in docs)
+    console.print("\n[bold green]Ready! Ask questions about your PDFs. Type 'exit' to quit.[/bold green]\n")
 
-    # LCEL chain: retrieve -> format -> prompt -> llm -> parse
-    rag_chain = (
-        {"context": retriever | format_docs, "input": RunnablePassthrough()}
-        | prompt
-        | llm
-        | StrOutputParser()
-    )
-    
-    print("\n---Local RAG with Guardrails is Ready! (Type 'exit' to quit)---")
     while True:
-        user_input = input("\nYour question: ")
-        if user_input.lower() == 'exit':
-            break;
-        
-        # 1. Apply Input Guardrail
-        if not input_guardrail(user_input):
-            print("Response [Blocked by Input Guardrail] Your query violated safety or formatting standards.")
-            continue
-        
-        # 2. Execute RAG Retrieval & Generation
         try:
-            raw_answer = rag_chain.invoke(user_input)
-            
-            # 3. Apply Output Guardrail
-            final_answer = output_guardrail(raw_answer)
-            
-            print(f"\nAnswer: {final_answer}")
+            user_input = input("Your question: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+
+        if user_input.lower() in ("exit", "quit", "q"):
+            break
+        if not user_input:
+            continue
+
+        # Input guardrail
+        if not input_guardrail(user_input):
+            console.print("[red]Blocked by input guardrail.[/red]\n")
+            continue
+
+        try:
+            result = query_rag(retriever, prompt, llm, user_input)
+
+            # Print structured JSON result
+            console.print("\n[bold magenta]Structured Result (JSON):[/bold magenta]")
+            console.print(RichJSON(json.dumps(result, indent=2)))
+            console.rule()
+
         except Exception as e:
-            print("An error occurred during retrieval or generation:", str(e))
-            
+            console.print(f"[red]Error during retrieval or generation: {e}[/red]")
+
+
 if __name__ == "__main__":
     main()

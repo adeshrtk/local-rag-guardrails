@@ -1,5 +1,4 @@
 # Core LangChain Framework
-
 langchain>=0.3.0
 langchain-community>=0.3.0
 langchain-ollama>=0.2.0
@@ -9,10 +8,17 @@ langchain-text-splitters>=0.3.0
 # Vector Store & Search
 chromadb>=0.5.0
 
+# PDF Loading
+pypdf>=4.0.0
+
 # Document Loaders & Embeddings Support
 sentence-transformers>=3.0.0
 unstructured>=0.15.0
 
+# UI & Progress
+rich>=13.0.0
+
 # General Utilities
 pydantic>=2.0.0
 tiktoken>=0.7.0
+requests>=2.31.0
