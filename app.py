@@ -19,6 +19,7 @@ DATA_PATH = "data"
 DB_PATH = "chroma_db"
 OLLAMA_MODEL = "llama3.2"
 EMBEDDING_MODEL = "nomic-embed-text"
+JUDGE_MODEL = "llama3.2"
 OLLAMA_BASE_URL = "http://localhost:11434"
 
 # ==========================================
@@ -67,6 +68,44 @@ def output_guardrail(response_text: str) -> str:
     if not response_text or len(response_text.strip()) == 0:
         return "Guardrail Error: The model returned an empty response."
     return response_text.replace("<|im_start|>", "").replace("<|im_end|>", "")
+
+# ==========================================
+# FAITHFULNESS JUDGE (LLM-AS-JUDGE)
+# ==========================================
+JUDGE_SYSTEM_PROMPT = (
+    "You are a strict factual-consistency judge for a RAG system. "
+    "You are given a retrieval context and an answer that was generated from it. "
+    "Your task is to decide whether the answer is FAITHFUL, meaning every claim in the "
+    "answer is supported by the provided context. "
+    "If the answer contains information that is not present in the context, it is unfaithful. "
+    "Respond with strict JSON only in the format: "
+    '{{"faithful": true, "score": 0.0}} '
+    "where score is a float between 0 and 1 (1.0 = fully grounded in the context)."
+)
+
+def judge_faithfulness(context: str, answer: str, llm) -> dict:
+    """Uses an LLM judge to score how faithfully the answer is grounded in the context."""
+    judge_prompt = ChatPromptTemplate.from_messages([
+        ("system", JUDGE_SYSTEM_PROMPT),
+        ("human", "Context:\n{context}\n\nAnswer:\n{answer}"),
+    ])
+    raw_judgment = (judge_prompt | llm | StrOutputParser()).invoke({
+        "context": context,
+        "answer": answer,
+    })
+
+    try:
+        parsed = json.loads(raw_judgment.strip())
+        score = float(parsed.get("score") or (1.0 if parsed.get("faithful") else 0.0))
+        return {"faithful": bool(parsed.get("faithful", True)), "score": score}
+    except (json.JSONDecodeError, TypeError, ValueError):
+        # Fallback heuristic if the judge response is not valid JSON
+        judgment_lower = raw_judgment.lower()
+        faithful = not any(
+            w in judgment_lower
+            for w in ["unfaithful", "not faithful", "not grounded", "hallucin"]
+        )
+        return {"faithful": faithful, "score": 1.0 if faithful else 0.0}
 
 # ==========================================
 # RAG PIPELINE SETUP
@@ -150,7 +189,13 @@ def query_rag(retriever, prompt, llm, user_input: str) -> dict:
     # 4. Apply output guardrail
     final_answer = output_guardrail(raw_answer)
 
-    # 5. Build deduplicated source metadata
+    # 5. LLM-as-judge faithfulness check
+    judge_llm = ChatOllama(model=JUDGE_MODEL, temperature=0)
+    judgment = judge_faithfulness(context, final_answer, judge_llm)
+    if not judgment["faithful"]:
+        console.print("[yellow][Guardrail] Answer flagged as unfaithful by the judge.[/yellow]")
+
+    # 6. Build deduplicated source metadata
     seen = set()
     sources = []
     for doc in source_docs:
@@ -168,7 +213,11 @@ def query_rag(retriever, prompt, llm, user_input: str) -> dict:
                 ),
             })
 
-    return {"answer": final_answer, "sources": sources}
+    return {
+        "answer": final_answer,
+        "sources": sources,
+        "faithfulness": judgment,
+    }
 
 # ==========================================
 # MAIN EXECUTION
