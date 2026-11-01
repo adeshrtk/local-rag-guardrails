@@ -1,5 +1,7 @@
 import os
 import json
+import shutil
+import sys
 import requests
 from langchain_community.document_loaders import PyPDFDirectoryLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -11,8 +13,17 @@ from langchain_core.output_parsers import StrOutputParser
 from rich.console import Console
 from rich.panel import Panel
 from rich.json import JSON as RichJSON
+import tiktoken
 
-console = Console()
+sys.stdout.reconfigure(encoding="utf-8")
+sys.stderr.reconfigure(encoding="utf-8")
+console = Console(legacy_windows=False)
+
+TOKENIZER = tiktoken.get_encoding("cl100k_base")
+
+def count_tokens(text: str) -> int:
+    """Approximate token count for an LLM prompt or response (tiktoken-based)."""
+    return len(TOKENIZER.encode(text))
 
 # --- CONFIGURATION ---
 DATA_PATH = "data"
@@ -20,7 +31,7 @@ DB_PATH = "chroma_db"
 OLLAMA_MODEL = "llama3.2"
 EMBEDDING_MODEL = "nomic-embed-text"
 JUDGE_MODEL = "llama3.2"
-OLLAMA_BASE_URL = "http://localhost:11434"
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
 # ==========================================
 # PRE-FLIGHT CHECK
@@ -129,35 +140,63 @@ def initialize_vector_db():
 
     console.print(f"[bold]Found {len(pdf_files)} PDF(s):[/bold] {', '.join(pdf_files)}")
 
-    with console.status("[bold green]Loading PDF pages...", spinner="dots"):
-        loader = PyPDFDirectoryLoader(DATA_PATH)
-        docs = loader.load()
-    console.print(f"[green]✓[/green] Loaded {len(docs)} pages from {len(pdf_files)} file(s)")
+    try:
+        with console.status("[bold green]Loading PDF pages...", spinner="dots"):
+            loader = PyPDFDirectoryLoader(DATA_PATH)
+            docs = loader.load()
+        console.print(f"[green]✓[/green] Loaded {len(docs)} pages from {len(pdf_files)} file(s)")
 
-    with console.status("[bold green]Splitting into chunks...", spinner="dots"):
-        splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-        chunks = splitter.split_documents(docs)
-    console.print(f"[green]✓[/green] Created {len(chunks)} chunks")
+        with console.status("[bold green]Splitting into chunks...", spinner="dots"):
+            splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=80)
+            chunks = splitter.split_documents(docs)
+            # Add section-level metadata to each chunk for better traceability/retrieval
+            for chunk in chunks:
+                lines = chunk.page_content.split("\n")
+                section = None
+                for line in lines:
+                    stripped = line.strip()
+                    if stripped.startswith("#") and len(stripped) > 2:
+                        section = stripped.lstrip("#").strip()
+                        break
+                if section:
+                    chunk.metadata["section"] = section
+        console.print(f"[green]✓[/green] Created {len(chunks)} chunks")
 
-    with console.status("[bold green]Generating embeddings & saving to ChromaDB...", spinner="dots"):
-        embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
-        vector_store = Chroma.from_documents(
-            documents=chunks, embedding=embeddings, persist_directory=DB_PATH
-        )
-    console.print(f"[green]✓[/green] Embeddings saved to ChromaDB")
+        with console.status("[bold green]Generating embeddings & saving to ChromaDB...", spinner="dots"):
+            embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL, base_url=OLLAMA_BASE_URL)
+            vector_store = Chroma(persist_directory=DB_PATH, embedding_function=embeddings)
+            # Embed in small batches: oversized payloads to the local Ollama
+            # embedding endpoint can time out / fail on large chunk sets.
+            EMBED_BATCH_SIZE = 25
+            for i in range(0, len(chunks), EMBED_BATCH_SIZE):
+                batch = chunks[i:i + EMBED_BATCH_SIZE]
+                vector_store.add_texts(
+                    texts=[c.page_content for c in batch],
+                    metadatas=[c.metadata for c in batch],
+                )
+        console.print(f"[green]✓[/green] Embeddings saved to ChromaDB")
+    except Exception as e:
+        console.print(f"[red]Error during ingestion: {e}[/red]")
+        console.print("[red]Cleaning up incomplete vector DB...[/red]")
+        shutil.rmtree(DB_PATH, ignore_errors=True)
+        raise
 
     return vector_store
 
 
 def get_or_create_db():
-    embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
+    embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL, base_url=OLLAMA_BASE_URL)
+    should_ingest = True
     if os.path.exists(DB_PATH) and os.listdir(DB_PATH):
-        with console.status("[bold green]Loading existing ChromaDB index...", spinner="dots"):
+        try:
             db = Chroma(persist_directory=DB_PATH, embedding_function=embeddings)
-        console.print("[green]✓[/green] Loaded existing ChromaDB index")
-        return db
-    else:
-        return initialize_vector_db()
+            should_ingest = len(db._client.list_collections()) == 0
+            if not should_ingest:
+                console.print("[green]✓[/green] Loaded existing ChromaDB index")
+                return db
+        except Exception:
+            should_ingest = True
+    return initialize_vector_db()
 
 # ==========================================
 # STREAMING QUERY + JSON RESULT
@@ -190,12 +229,32 @@ def query_rag(retriever, prompt, llm, user_input: str) -> dict:
     final_answer = output_guardrail(raw_answer)
 
     # 5. LLM-as-judge faithfulness check
-    judge_llm = ChatOllama(model=JUDGE_MODEL, temperature=0)
+    judge_llm = ChatOllama(model=JUDGE_MODEL, temperature=0, base_url=OLLAMA_BASE_URL)
     judgment = judge_faithfulness(context, final_answer, judge_llm)
     if not judgment["faithful"]:
         console.print("[yellow][Guardrail] Answer flagged as unfaithful by the judge.[/yellow]")
 
-    # 6. Build deduplicated source metadata
+    # 6. Calculate token usage (generation + judge)
+    generation_prompt_tokens = count_tokens(f"{context}\n\n{user_input}")
+    generation_completion_tokens = count_tokens(final_answer)
+    judge_prompt_tokens = count_tokens(JUDGE_SYSTEM_PROMPT) + count_tokens(
+        f"Context:\n{context}\n\nAnswer:\n{final_answer}"
+    )
+    judge_completion_tokens = count_tokens(json.dumps(judgment))
+    token_usage = {
+        "generation_prompt_tokens": generation_prompt_tokens,
+        "generation_completion_tokens": generation_completion_tokens,
+        "judge_prompt_tokens": judge_prompt_tokens,
+        "judge_completion_tokens": judge_completion_tokens,
+        "total_tokens": (
+            generation_prompt_tokens
+            + generation_completion_tokens
+            + judge_prompt_tokens
+            + judge_completion_tokens
+        ),
+    }
+
+    # 7. Build deduplicated source metadata
     seen = set()
     sources = []
     for doc in source_docs:
@@ -217,6 +276,7 @@ def query_rag(retriever, prompt, llm, user_input: str) -> dict:
         "answer": final_answer,
         "sources": sources,
         "faithfulness": judgment,
+        "token_usage": token_usage,
     }
 
 # ==========================================
@@ -228,7 +288,7 @@ def main():
     vector_store = get_or_create_db()
     retriever = vector_store.as_retriever(search_kwargs={"k": 3})
 
-    llm = ChatOllama(model=OLLAMA_MODEL, temperature=0.1)
+    llm = ChatOllama(model=OLLAMA_MODEL, temperature=0.1, base_url=OLLAMA_BASE_URL)
 
     system_prompt = (
         "You are an assistant for question-answering tasks. "
